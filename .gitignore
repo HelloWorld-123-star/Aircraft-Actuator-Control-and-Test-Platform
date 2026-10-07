@@ -1,0 +1,15 @@
+# STM32CubeIDE build output
+Debug/
+Release/
+
+# Compiled files
+*.o
+*.d
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+
+# macOS
+.DS_Store
