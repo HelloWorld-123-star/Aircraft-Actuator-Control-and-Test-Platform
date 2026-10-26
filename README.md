@@ -6,7 +6,7 @@ The Aircraft Actuator Control and Test Platform is an embedded systems project f
 
 An **STM32 NUCLEO-F446RE** handles motor control, encoder feedback, sensor readings, and communication. A **CLICK PLUS PLC** exchanges data with the STM32 over **Modbus TCP**, while a **Python-based HMI** provides live monitoring and command testing.
 
-Motor operation, encoder feedback, Ethernet communication, basic PLC logic, and HMI communication have been tested. Full closed-loop positioning and physical safety functions are still under development.
+Motor operation, encoder feedback, Ethernet communication, basic PLC logic, and HMI communication have been tested. Short HMI-controlled closed-loop positioning and powered STOP tests have also been completed. Independent physical safety functions and long-duration reliability testing are still under development.
 
 ## Hardware and Software
 
@@ -16,7 +16,7 @@ Motor operation, encoder feedback, Ethernet communication, basic PLC logic, and 
 | 12 V geared DC motor + driver | PWM motor control |
 | Quadrature encoder | Position feedback |
 | WIZ550IO / W5500 | Ethernet connection over SPI |
-| CLICK PLUS C2-01CPU | PLC communication and basic Ladder Logic |
+| CLICK PLUS C2-01CPU | PLC communication and Ladder Logic |
 | DS18B20 | Motor temperature readings |
 | ADXL345 | Vibration measurements over I²C |
 | ACS724 | Current sensing (still being tested) |
@@ -56,7 +56,7 @@ Motor output and encoder feedback were first tested directly through the STM32 f
 - Configured **TIM4 in encoder mode** and verified that encoder counts changed during motor rotation.
 - Developed an initial proportional position-control routine with position-error calculation, PWM adjustment, target tolerance, and a **5-second timeout**.
 
-Motor rotation and encoder feedback have been verified. The position-control routine has not yet been connected to the HMI MOVE command for physical closed-loop operation.
+Motor rotation and encoder feedback have been verified. The position-control routine was subsequently connected to the HMI MOVE command and verified during short physical motor-positioning tests (see Section 5).
 
 ### Sensors and STM32 Peripherals
 
@@ -105,49 +105,73 @@ The following Modbus function codes were tested:
 
 ## 4. CLICK PLC Ladder Logic
 
-The retained PLC program contains 18 rungs and focuses on Modbus communication, heartbeat monitoring, and sending a STOP command. Earlier experiments with run/fault latches, manual/automatic modes, and a separate acknowledgment-read sequence are not part of this version.
+[View Complete PLC Ladder Logic (PDF)](docs/plc-ladder-logic.pdf)
+
+The final CLICK PLUS program contains **18 rungs** and focuses on Modbus communication, heartbeat monitoring, and sending a STOP command. More complex run/fault latches and manual/automatic modes from earlier versions were removed.
 
 ### Heartbeat and Communication Status (Rungs 1–7)
 
-The PLC reads a heartbeat value into `DS6` and compares it with the previous value in `DS31`. A change activates `HeartbeatChanged` (`C67`) and updates `DS31`. Once a valid heartbeat has been observed, `HeartbeatValid` (`C68`) is set. If the heartbeat stops changing for 3 seconds, timer `T1` activates `CommTimeout` (`C59`). `CommOK` (`C52`) is on when a valid heartbeat has been received and no timeout is active.
+- Compares the current heartbeat in `DS6` with the previous value stored in `DS31`.
+- When the value changes, updates `DS31` and sets the `HeartbeatValid` flag (`C68`).
+- Uses a **3-second timer (`T1`)** to detect when heartbeat updates stop.
+- Sets `CommTimeout` (`C59`) on timeout and uses `CommOK` (`C52`) to indicate valid communication without a timeout.
 
-### STOP Command and Modbus Write (Rungs 8–15)
+### STOP Command and Modbus Read/Write (Rungs 8–17)
 
-A `StopPending` request (`C111`) copies `0` into `DS20`. When communication is OK, `StopReady` (`C112`) generates a one-shot `StopPulse` (`C114`). The pulse increments the command sequence in `DS22` and sets `SendTrigger` (`C81`). A 500 ms timer (`T2`) resets that trigger. The Modbus **FC16** instruction writes three registers starting from `DS20`, with `C83` and `C84` indicating success and error respectively. The PLC program therefore prepares and transmits a STOP command; this does not by itself establish that the physical motor stops.
+- A `StopPending` request (`C111`) copies **`0` into `DS20`** as the STOP command.
+- When communication is available, `StopReady` (`C112`) generates a one-shot `StopPulse` (`C114`). The pulse increments the sequence value in `DS22` and sets `SendTrigger` (`C81`).
+- A **500 ms timer (`T2`)** resets the send trigger. The **FC16** instruction writes **three registers starting at `DS20`** to the STM32.
+- The **FC03** instruction reads **four holding registers into `DS3–DS6`**, including the heartbeat. Conditions on the send and receive instructions help coordinate the two operations.
 
-### Modbus Read (Rungs 16–17)
+### Main PLC Addresses
 
-The program enables a Modbus **FC03** read when no FC16 send is active and `SendTrigger` is off. It reads four holding registers into `DS3` through `DS6`, including the heartbeat value used by the monitoring logic. The receive instruction exposes success and error indicators (`C14` and `C15`) and stores its exception code in `DS10`.
-
-| PLC address | Purpose in the retained program |
+| Address | Purpose |
 |---|---|
-| `DS3–DS6` | Four holding registers read from STM32; `DS6` is used as heartbeat |
+| `DS3–DS6` | Four registers read from the STM32; `DS6` holds the heartbeat |
 | `DS31` | Previous heartbeat value |
 | `DS20` | STOP command value (`0`) |
-| `DS21` | Included in the three-register FC16 write block |
-| `DS22` | Incremented command sequence |
+| `DS21` | Included in the three-register FC16 write; its application meaning is not established by the ladder diagram alone |
+| `DS22` | Sequence value incremented for a STOP request |
 | `C52` / `C59` | Communication OK / timeout |
-| `C111` / `C112` / `C114` | STOP pending / ready / one-shot pulse |
-| `C81` | FC16 send trigger |
-| `C83` / `C84` | FC16 success / error |
+| `C111` | `StopPending` request |
+| `C112` / `C114` / `C81` | `StopReady` / `StopPulse` / `SendTrigger` |
 
-The current ladder logic has been tested for communication and command transmission. Physical STOP performance, communication-loss behavior during powered motion, and long-term reliability still require testing.
+Basic tests confirmed PLC register reads, heartbeat updates, and receipt of an FC16 STOP request by the STM32. This confirms **communication**, not physical stopping of a powered motor. The final program does not include the separate acknowledgment-read sequence used in earlier experiments.
 
 ## 5. Python HMI
 
+### HMI Dashboard
+
+![HMI Dashboard](docs/images/hmi-dashboard.png)
+
 A desktop HMI was developed using **Python, PySide6, and PySerial**, communicating with the STM32 over USB serial at **115200 baud**.
 
-The interface includes live commanded and encoder positions, position error, movement time, temperature, vibration, system status, a position-history graph, target-position input, MOVE/STOP controls, connection status, diagnostics, and event logging.
+The interface includes:
 
-### Physical Motion and Position Control
+- Live commanded position, encoder position, position error, and movement-time fields.
+- Temperature, vibration, and system-status displays.
+- A position-history graph.
+- Target-position input and MOVE/STOP buttons.
+- Serial-port selection, connection status, and timeout detection.
+- A diagnostics panel, event logs, and log export.
 
-The HMI **MOVE** command has been tested with actual motor movement, not just UART message exchange. The STM32 uses TIM4 encoder feedback and a basic proportional position controller to move toward the requested target. The tested controller used `Kp = 0.01`, a **±20-count deadband**, and a **1000 ms MOVE timeout**. TIM3 PWM compare values were limited to 6–10 during the tested control sequence; these are compare values, not duty-cycle percentages.
+### Command and Physical Motor Tests
 
-The HMI **STOP** command was also demonstrated during powered motion. The STM32 reported STOP and a TIM3 PWM compare value of **0**. This is a **software STOP**, not a verified hardware emergency stop or motor-power disconnect.
+The HMI MOVE command is connected to the STM32 position-control routine. During short bench tests, MOVE commands physically drove the 12 V motor, with TIM4 encoder feedback used to track position and determine when the target was reached. The controller uses proportional position correction (`Kp = 0.01`), a tolerance of ±20 encoder counts, and a 1-second MOVE timeout. PWM values of 6–10 are timer compare values, not percentages.
 
-A forced MOVE timeout test reported a position error and a TIM3 PWM compare readback of **0**, verifying the firmware's timeout shutdown path. Mechanical stopping distance was not measured.
+The HMI STOP command was also tested **while the motor was powered and moving**. The motor stopped and the TIM3 PWM compare value was confirmed as `0`. An unreachable target was used to test the MOVE timeout, which likewise stopped PWM output and reported a timeout. These are software-level stop tests, **not** validation of an independent hardware emergency stop.
 
-Some HMI messages still contain legacy labels such as `TEST MODE` and `software only`; these labels need cleanup to reflect the tested functionality.
+The HMI also supports live position feedback, event logging, and communication-loss indications. Some existing interface messages still use the legacy **TEST MODE** wording even though physical MOVE has now been tested.
+
+### Position Accuracy and Repeatability
+
+| Target (encoder counts) | Final position | Signed error (target − final) |
+|---|---|---|
+| 0 | -2 | +2 |
+| 100 | 108 | -8 |
+| 200 | 210 | -10 |
+
+Six alternating target commands between 0 and 200 counts produced final encoder readings of `-14, 213, -14, 213, -14, 213`. The maximum absolute error in that short sequence was **14 counts**. These measurements are encoder counts, not calibrated actuator travel distances; they do not establish long-term repeatability or loaded performance.
 
 ## 6. Test Results
 
@@ -158,28 +182,17 @@ Some HMI messages still contain legacy labels such as `TEST MODE` and `software 
 | W5500 SPI communication | Passed |
 | Ethernet link and ping | Passed |
 | Modbus TCP FC03, FC06, FC16 | Passed in basic tests |
-| PLC heartbeat and STOP command communication | Passed (communication only) |
-| HMI live telemetry and MOVE/STOP command exchange | Passed |
-| HMI MOVE controlling physical motor movement | Passed |
-| Encoder-based proportional position control | Passed in short tests |
-| HMI software STOP during powered movement | Demonstrated; PWM compare reported 0 |
-| MOVE timeout protection | Passed; PWM compare readback 0 |
-| Position targets 0, 100, and 200 counts | All final errors within ±20 counts |
-| Six alternating 0 ↔ 200 position commands | Passed; maximum absolute final error 14 counts |
-| Current measurement and overcurrent protection | Not yet verified |
-| Independent hardware emergency stop | Not yet verified |
-| PLC-controlled physical motor movement | Not yet verified |
+| PLC heartbeat and STOP command communication | Passed |
+| HMI live display and MOVE/STOP message exchange | Passed |
+| HMI-controlled closed-loop motor positioning | Passed in short physical tests |
+| HMI STOP during powered motor motion | Passed; PWM compare returned to 0 |
+| MOVE timeout protection | Passed; PWM compare returned to 0 |
+| Position targets 0, 100, and 200 counts | Final errors within ±20 counts |
+| Six alternating 0 ↔ 200 count moves | Passed; maximum absolute error 14 counts |
+| ACS724 current measurement | Not yet verified |
+| Independent physical emergency stop | Not yet tested |
+| PLC-commanded physical motor STOP | Not yet tested (Modbus communication only) |
 | Long-duration system reliability | Not yet tested |
-
-### Position Test Details
-
-| Target (counts) | Final encoder position | Signed error (target − position) |
-|---:|---:|---:|
-| 0 | -2 | +2 |
-| 100 | 108 | -8 |
-| 200 | 210 | -10 |
-
-Six successive commands alternating between 0 and 200 counts returned final positions of **-14, 213, -14, 213, -14, and 213** counts, respectively. All were within the ±20-count deadband; the largest absolute error was **14 counts**. This indicates short-term repeatability under the tested conditions, not calibrated position accuracy or long-term reliability.
 
 ## 7. Firmware Architecture and Additional Interfaces
 
@@ -189,14 +202,14 @@ These interfaces and RTOS features have not yet been implemented or verified.
 
 ## 8. Next Steps
 
-- Validate the current sensor with the 12 V motor circuit and calibrate current measurements before implementing overcurrent protection.
-- Improve DS18B20 wiring and sensor-read timing.
-- Add and test an independent physical emergency-stop circuit and suitable electrical protection.
-- Integrate the existing PLC Modbus commands with actual STM32 motor control; PLC-to-motor operation is not yet verified.
-- Test communication-loss behavior, mechanical limits, and fault handling during powered motion.
-- Run longer tests with the PLC, STM32, sensors, and HMI together, including different loads.
-- Clean up outdated `TEST MODE` labels in the HMI.
-
+- Finish testing and calibrating the ACS724 current sensor.
+- Improve the DS18B20 wiring and sensor-read timing.
+- Add a physical emergency-stop circuit and suitable electrical protection.
+- Validate the physical emergency-stop circuit independently of software STOP.
+- Test PLC-commanded physical motor stopping, beyond the existing Modbus communication tests.
+- Further test fault handling, communication loss, mechanical travel limits, and stopping behavior during powered motion.
+- Run longer tests with the PLC, STM32, sensors, and HMI working together.
+- If time permits, design a custom PCB to replace the breadboard setup and improve wiring and component integration.
 ---
 
 **Project scope:** This is an engineering prototype, not a certified aircraft actuator controller. Software STOP commands do not replace a physical emergency-stop circuit.
