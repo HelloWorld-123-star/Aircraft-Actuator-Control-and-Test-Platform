@@ -91,10 +91,14 @@ int16_t actualPosition = 0;
 int16_t positionError = 0;
 uint32_t movementTime_ms = 0;
 char rxBuffer[50];
-char commandBuffer[50];
 uint8_t rxByte;
 uint8_t rxIndex = 0;
-volatile uint8_t commandReady = 0;
+
+#define CMD_QUEUE_SIZE 4
+char commandQueue[CMD_QUEUE_SIZE][50];
+volatile uint8_t commandHead = 0;
+volatile uint8_t commandTail = 0;
+volatile uint8_t commandCount = 0;
 volatile uint8_t stopRequested = 0;
 uint16_t modbusRegister = 0;
 uint8_t lastDS18B20Raw[9] = {0};
@@ -111,7 +115,11 @@ static uint32_t motionStartTick = 0;
 static int16_t motionLastPosition = 0;
 static uint32_t motionLastProgressTick = 0;
 // Keep physical motor output disabled during software integration
-static const uint8_t motionOutputEnabled = 0;
+static const uint8_t motionOutputEnabled = 1;
+volatile uint8_t motorTestRunning = 0;
+volatile uint8_t motorTestFinished = 0;
+uint32_t motorTestStart = 0;
+volatile uint32_t tim2InterruptCount = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -1074,7 +1082,8 @@ float DS18B20_ReadTemperature(void)
 
 void Motor_Stop(void)
 {
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 0);
+	// Set PWM to 0 to stop driving the motor
+	__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 0);
 }
 
 
@@ -1094,7 +1103,8 @@ void Motor_Backward(void)
 }
 
 
-// Measure the voltage using the ACS724 100 times when the motor is not running,
+// Measure the ACS724 output 20 times while the motor is stopped.
+// Use the average ADC reading as the zero-current reference.
 // and take the average value. Use this average voltage as the "0 A reference"
 // Find the ACS724 zero-current ADC value and show the raw readings
 void ACS724_CalibrateZero(void)
@@ -1105,11 +1115,17 @@ void ACS724_CalibrateZero(void)
     // Read the sensor 20 times while the motor is stopped
     for (int i = 0; i < 20; i++)
     {
-        HAL_ADC_Start(&hadc1);
-        // Wait until the ADC finishes one reading
-        HAL_ADC_PollForConversion(&hadc1, 100);
-        // Save this ADC reading
-        uint32_t rawADC = HAL_ADC_GetValue(&hadc1);
+    	uint32_t rawADC = 0;
+
+    	if (HAL_ADC_Start(&hadc1) == HAL_OK)
+    	{
+    	    if (HAL_ADC_PollForConversion(&hadc1, 100) == HAL_OK)
+    	    {
+    	        rawADC = HAL_ADC_GetValue(&hadc1);
+    	    }
+    	}
+
+    	HAL_ADC_Stop(&hadc1);
         // Add it to the total for the final average
         sum += rawADC;
         // Save the first 10 and last 10 samples separately
@@ -1229,14 +1245,14 @@ SystemStatus UpdateSystemStatus(float current,
                                 float vibration)
 {
     // ERROR conditions
-    if (current >= 0.90f ||
+    if (current >= 10.0f ||
         temperature >= 80.0f ||
         vibration >= 1.00f)
     {
         return STATUS_ERROR;
     }
     // WARNING conditions
-    if (current >= 0.70f ||
+    if (current >= 9.0f ||
         temperature >= 60.0f ||
         vibration >= 0.50f)
     {
@@ -1357,23 +1373,50 @@ float ADXL345_ReadVibrationRMS(void)
 // Move the actuator to the target position
 void Actuator_MoveTo(int16_t targetPosition)
 {
-    float Kp = 0.01f;
+    // Motor output must be explicitly enabled
+	if (!motionOutputEnabled)
+	{
+	    Motor_Stop();
+
+	    commandedPosition = targetPosition;
+	    actualPosition = (int16_t)__HAL_TIM_GET_COUNTER(&htim4);
+	    positionError = commandedPosition - actualPosition;
+
+	    snprintf(txBuffer, sizeof(txBuffer),
+	             "MOVE TEST | Target:%d Position:%d Error:%d PWM:0\r\n",
+	             commandedPosition,
+	             actualPosition,
+	             positionError);
+
+	    HAL_UART_Transmit(&huart2,
+	                      (uint8_t *)txBuffer,
+	                      strlen(txBuffer),
+	                      100);
+	    return;
+	}
+
+	float Kp = 0.01f;
     int16_t deadband = 20;
-    uint32_t timeout = 5000;
+    uint32_t timeout = 1000;
     uint32_t startTime = HAL_GetTick();
-    int16_t lastPrintedPosition = 0;
+    uint32_t lastDataTick = 0;
     // Save the commanded position
     commandedPosition = targetPosition;
     // Reset movement data
     movementTime_ms = 0;
-    stopRequested = 0;
     while (1)
     {
-        // Stop the actuator if requested
+        // Stop if motor output is disabled
+        if (!motionOutputEnabled)
+        {
+            Motor_Stop();
+            return;
+        }
+
+    	// Stop the actuator if requested
         if (stopRequested)
         {
             Motor_Stop();
-            stopRequested = 0;
 
             actualPosition =
                 (int16_t)__HAL_TIM_GET_COUNTER(&htim4);
@@ -1425,6 +1468,13 @@ void Actuator_MoveTo(int16_t targetPosition)
         if (abs(positionError) <= deadband)
         {
             Motor_Stop();
+            // Wait for the motor to stop moving
+            HAL_Delay(100);
+
+            // Read the final position
+            actualPosition = (int16_t)__HAL_TIM_GET_COUNTER(&htim4);
+            positionError = commandedPosition - actualPosition;
+
             snprintf(txBuffer, sizeof(txBuffer),
                      "TARGET REACHED | Target:%d Position:%d Error:%d Time:%lu ms\r\n",
                      commandedPosition,
@@ -1443,6 +1493,15 @@ void Actuator_MoveTo(int16_t targetPosition)
             Motor_Stop();
             systemStatus = STATUS_ERROR;
             snprintf(txBuffer, sizeof(txBuffer),
+                     "TIMEOUT PWM: %lu\r\n",
+                     (unsigned long)__HAL_TIM_GET_COMPARE(&htim3, TIM_CHANNEL_1));
+
+            HAL_UART_Transmit(&huart2,
+                              (uint8_t *)txBuffer,
+                              strlen(txBuffer),
+                              100);
+
+            snprintf(txBuffer, sizeof(txBuffer),
                      "POSITION ERROR | Target:%d Position:%d Error:%d Time:%lu ms | Status:ERROR\r\n",
                      commandedPosition,
                      actualPosition,
@@ -1459,14 +1518,19 @@ void Actuator_MoveTo(int16_t targetPosition)
         uint32_t pwm =
             (uint32_t)(Kp * absoluteError);
         // Limit maximum PWM
-        if (pwm > 12)
-        {
-            pwm = 12;
-        }
-        // Keep enough PWM to move the motor
-        if (pwm < 10)
+        if (pwm > 10)
         {
             pwm = 10;
+        }
+        // Keep enough PWM to move the motor
+        if (pwm < 8)
+        {
+            pwm = 8;
+        }
+        // Slow down when the motor is close to the target
+        if (absoluteError < 100)
+        {
+            pwm = 6;
         }
         // Choose motor direction
         if (positionError < 0)
@@ -1481,22 +1545,74 @@ void Actuator_MoveTo(int16_t targetPosition)
         __HAL_TIM_SET_COMPARE(&htim3,
                               TIM_CHANNEL_1,
                               pwm);
-        // Show movement progress
-        if (abs(actualPosition - lastPrintedPosition) >= 500)
+        // Send the current position to the HMI
+        if (HAL_GetTick() - lastDataTick >= 100)
         {
+            lastDataTick = HAL_GetTick();
+
             snprintf(txBuffer, sizeof(txBuffer),
-                     "Target:%d Position:%d Error:%d PWM:%lu Time:%lu ms\r\n",
+                     "DATA,%d,%d,%d,%lu,%.2f,%.2f,%.3f,%d\r\n",
                      commandedPosition,
                      actualPosition,
                      positionError,
-                     (unsigned long)pwm,
-                     (unsigned long)movementTime_ms);
+                     (unsigned long)movementTime_ms,
+                     motorCurrent,
+                     motorTemperature,
+                     vibrationRMS_g,
+                     systemStatus);
+
             HAL_UART_Transmit(&huart2,
                               (uint8_t *)txBuffer,
                               strlen(txBuffer),
                               100);
-            lastPrintedPosition = actualPosition;
         }
+    }
+}
+
+
+void ADC_TestVREFINT(void)
+{
+    ADC_ChannelConfTypeDef sConfig = {0};
+
+    // Switch ADC1 to internal VREFINT
+    sConfig.Channel = ADC_CHANNEL_VREFINT;
+    sConfig.Rank = 1;
+    sConfig.SamplingTime = ADC_SAMPLETIME_480CYCLES;
+
+    if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+    {
+        printf("VREFINT configuration failed\r\n");
+        return;
+    }
+
+    HAL_Delay(1);
+
+    if (HAL_ADC_Start(&hadc1) == HAL_OK)
+    {
+        if (HAL_ADC_PollForConversion(&hadc1, 100) == HAL_OK)
+        {
+            uint32_t vrefRaw = HAL_ADC_GetValue(&hadc1);
+            char msg[64];
+
+            snprintf(msg, sizeof(msg),
+                     "VREFINT ADC: %lu\r\n",
+                     (unsigned long)vrefRaw);
+
+            HAL_UART_Transmit(&huart2,
+                              (uint8_t *)msg,
+                              strlen(msg),
+                              100);
+        }
+
+        HAL_ADC_Stop(&hadc1);
+    }
+
+    // Restore PA0 (ADC Channel 0)
+    sConfig.Channel = ADC_CHANNEL_0;
+
+    if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+    {
+        printf("PA0 restore failed\r\n");
     }
 }
 /* USER CODE END 0 */
@@ -1536,6 +1652,21 @@ int main(void)
   MX_TIM5_Init();
   MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
+  uint8_t inaStatus;
+
+  inaStatus = HAL_I2C_IsDeviceReady(&hi2c1, 0x40 << 1, 3, 100);
+
+  if (inaStatus == HAL_OK)
+  {
+      char msg[] = "INA219 Connected\r\n";
+      HAL_UART_Transmit(&huart2, (uint8_t *)msg, strlen(msg), 100);
+  }
+  else
+  {
+      char msg[] = "INA219 Not Found\r\n";
+      HAL_UART_Transmit(&huart2, (uint8_t *)msg, strlen(msg), 100);
+  }
+
   // Reset W5500
   W5500_Reset();
 
@@ -1578,6 +1709,7 @@ int main(void)
 //                    100);
   // Recover the I2C bus
 //  I2C1_BusRecovery();
+#if 0
   // Read the ADXL345 device ID
   HAL_StatusTypeDef adxlStatus;
   adxlStatus = HAL_I2C_Mem_Read(&hi2c1,
@@ -1613,6 +1745,7 @@ int main(void)
                         strlen(txBuffer),
                         100);
   }
+#endif
   // Show the I2C bus state
   snprintf(txBuffer, sizeof(txBuffer),
            "I2C Bus: SCL=%d SDA=%d\r\n",
@@ -1683,24 +1816,39 @@ int main(void)
   HAL_GPIO_WritePin(MOTOR_B1_GPIO_Port, MOTOR_B1_Pin, GPIO_PIN_RESET);
   // Start the encoder so STM32 can track the motor position
   HAL_TIM_Encoder_Start(&htim4, TIM_CHANNEL_ALL);
+
   // Treat the current motor position as position 0
   __HAL_TIM_SET_COUNTER(&htim4, 0);
-  // Start PWM for motor control
-  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
-  // Keep the motor stopped
+  // Keep motor off before starting PWM
   __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 0);
 
-  // One-time motor control test
-  Motor_Backward();
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+  // Start TIM2 interrupt for motor test timeout
+  HAL_TIM_Base_Start_IT(&htim2);
 
-  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 15);
+  // Keep the motor stopped first
+  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 0);
 
-  HAL_Delay(500);
+//  // Test the motor
+//  Motor_Backward();
+//  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 15);
+//
+//  HAL_Delay(500);
+//
+//  Motor_Stop();
 
-  Motor_Stop();
+//  // One-time motor control test
+//  Motor_Backward();
+//
+//  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 15);
+//
+//  HAL_Delay(500);
+//
+//  Motor_Stop();
 
   const char msg[] = "MOTOR TEST COMPLETED\r\n";
   HAL_UART_Transmit(&huart2, (uint8_t *)msg, sizeof(msg) - 1, 100);
+  HAL_Delay(5000);
   // Find the ACS724 voltage at 0 A
   // ACS724_CalibrateZero();
 
@@ -1720,6 +1868,230 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+
+	    // Test INA219 every 2 seconds
+	    static uint32_t lastINA219Check = 0;
+
+	    if (HAL_GetTick() - lastINA219Check >= 2000)
+	    {
+	        lastINA219Check = HAL_GetTick();
+
+	        HAL_StatusTypeDef status;
+	        uint8_t data[2];
+
+	        status = HAL_I2C_IsDeviceReady(&hi2c1, 0x40 << 1, 3, 100);
+
+	        if (status == HAL_OK)
+	        {
+	            const char msg[] = "INA219 Connected\r\n";
+	            HAL_UART_Transmit(&huart2, (uint8_t *)msg,
+	                              sizeof(msg) - 1, 100);
+
+	            // Read bus voltage
+	            status = HAL_I2C_Mem_Read(&hi2c1, 0x40 << 1, 0x02,
+	                                      I2C_MEMADD_SIZE_8BIT,
+	                                      data, 2, 100);
+
+	            if (status == HAL_OK)
+	            {
+	                uint16_t raw = ((uint16_t)data[0] << 8) | data[1];
+	                uint32_t voltage_mV = (raw >> 3) * 4;
+
+	                snprintf(txBuffer, sizeof(txBuffer),
+	                         "INA219 Bus Voltage: %lu mV\r\n",
+	                         (unsigned long)voltage_mV);
+
+	                HAL_UART_Transmit(&huart2, (uint8_t *)txBuffer,
+	                                  strlen(txBuffer), 100);
+	            }
+	            else
+	            {
+	                snprintf(txBuffer, sizeof(txBuffer),
+	                         "INA219 Bus Read Failed: %d\r\n", status);
+
+	                HAL_UART_Transmit(&huart2, (uint8_t *)txBuffer,
+	                                  strlen(txBuffer), 100);
+	            }
+
+	            // Read shunt voltage
+	            status = HAL_I2C_Mem_Read(&hi2c1, 0x40 << 1, 0x01,
+	                                      I2C_MEMADD_SIZE_8BIT,
+	                                      data, 2, 100);
+
+	            if (status == HAL_OK)
+	            {
+	                int16_t shuntRaw = (int16_t)(
+	                    ((uint16_t)data[0] << 8) | data[1]
+	                );
+
+	                // Each step is 10 uV, R100 = 0.1 ohm
+	                // Current in mA = shuntRaw / 10
+	                int32_t current_mA = shuntRaw / 10;
+
+	                motorCurrent = shuntRaw * 0.0001f;
+
+	                snprintf(txBuffer, sizeof(txBuffer),
+	                         "INA219 Shunt Raw: %d | Current: %ld mA\r\n",
+	                         (int)shuntRaw,
+	                         (long)current_mA);
+
+	                HAL_UART_Transmit(&huart2, (uint8_t *)txBuffer,
+	                                  strlen(txBuffer), 100);
+	            }
+	            else
+	            {
+	                motorCurrent = 0.0f;
+
+	                snprintf(txBuffer, sizeof(txBuffer),
+	                         "INA219 Shunt Read Failed: %d\r\n", status);
+
+	                HAL_UART_Transmit(&huart2, (uint8_t *)txBuffer,
+	                                  strlen(txBuffer), 100);
+	            }
+	        }
+	        else
+	        {
+	            motorCurrent = 0.0f;
+
+	            snprintf(txBuffer, sizeof(txBuffer),
+	                     "INA219 Not Found: %d\r\n", status);
+
+	            HAL_UART_Transmit(&huart2, (uint8_t *)txBuffer,
+	                              strlen(txBuffer), 100);
+	        }
+
+	        snprintf(txBuffer, sizeof(txBuffer),
+	                 "I2C Error: 0x%08lX\r\n",
+	                 (unsigned long)HAL_I2C_GetError(&hi2c1));
+
+	        HAL_UART_Transmit(&huart2, (uint8_t *)txBuffer,
+	                          strlen(txBuffer), 100);
+	    }
+
+	  // Scan I2C addresses every 5 seconds
+	  static uint32_t lastI2CScan = 0;
+
+	  if (HAL_GetTick() - lastI2CScan >= 5000)
+	  {
+	      lastI2CScan = HAL_GetTick();
+
+	      char msg[40];
+
+	      for (uint8_t addr = 1; addr < 127; addr++)
+	      {
+	          if (HAL_I2C_IsDeviceReady(&hi2c1, addr << 1, 2, 20) == HAL_OK)
+	          {
+	              int len = snprintf(msg, sizeof(msg),
+	                                 "I2C Found: 0x%02X\r\n", addr);
+
+	              HAL_UART_Transmit(&huart2, (uint8_t *)msg, len, 100);
+	          }
+	      }
+
+	      HAL_UART_Transmit(&huart2,
+	                        (uint8_t *)"I2C Scan Finished\r\n",
+	                        strlen("I2C Scan Finished\r\n"), 100);
+	  }
+
+	  // Stop the motor test after 1 second
+	  if (motorTestRunning && HAL_GetTick() - motorTestStart >= 1000)
+	  {
+	      Motor_Stop();
+	      motorTestRunning = 0;
+	  }
+
+	  // Show TIM2 interrupt count every second
+	  static uint32_t lastTim2Print = 0;
+
+	  if (HAL_GetTick() - lastTim2Print >= 1000)
+	  {
+	      lastTim2Print = HAL_GetTick();
+
+	      snprintf(txBuffer, sizeof(txBuffer),
+	               "TIM2 Count: %lu\r\n",
+	               (unsigned long)tim2InterruptCount);
+
+	      HAL_UART_Transmit(&huart2,
+	                        (uint8_t *)txBuffer,
+	                        strlen(txBuffer),
+	                        100);
+	  }
+
+	  // Show when the motor test finishes
+	  if (motorTestFinished)
+	  {
+	      motorTestFinished = 0;
+
+	      snprintf(txBuffer, sizeof(txBuffer),
+	               "TEST AUTO STOP | PWM:%lu\r\n",
+	               (unsigned long)__HAL_TIM_GET_COMPARE(&htim3, TIM_CHANNEL_1));
+
+	      HAL_UART_Transmit(&huart2,
+	                        (uint8_t *)txBuffer,
+	                        strlen(txBuffer),
+	                        100);
+	  }
+
+	  // Handle STOP first
+	  if (stopRequested)
+	  {
+	      Motor_Stop();
+	      motorTestRunning = 0;
+	      stopRequested = 0;
+
+	      // Show the PWM value after STOP
+	      snprintf(txBuffer, sizeof(txBuffer),
+	               "STOP PWM:%lu\r\n",
+	               (unsigned long)__HAL_TIM_GET_COMPARE(&htim3, TIM_CHANNEL_1));
+
+	      HAL_UART_Transmit(&huart2,
+	                        (uint8_t *)txBuffer,
+	                        strlen(txBuffer),
+	                        100);
+
+	      const char msg[] = "STOP CONFIRMED\r\n";
+	      HAL_UART_Transmit(&huart2, (uint8_t *)msg, sizeof(msg) - 1, 100);
+	  }
+
+	  // Get the next command
+	  char nextCommand[50];
+	  uint8_t hasCommand = 0;
+
+	  __disable_irq();
+
+	  if (commandCount > 0)
+	  {
+	      strcpy(nextCommand, commandQueue[commandTail]);
+
+	      commandTail = (commandTail + 1) % CMD_QUEUE_SIZE;
+	      commandCount--;
+
+	      hasCommand = 1;
+	  }
+
+	  __enable_irq();
+
+	  if (hasCommand)
+	  {
+	      ProcessCommand(nextCommand);
+
+	      // Show when STM32 finishes a command
+	      const char msg[] = "DEBUG: Command finished\r\n";
+	      HAL_UART_Transmit(&huart2,
+	                        (uint8_t *)msg,
+	                        sizeof(msg) - 1,
+	                        100);
+	  }
+
+	  // Test internal ADC reference every 5 seconds
+	  static uint32_t lastVrefTestTick = 0;
+
+	  if (HAL_GetTick() - lastVrefTestTick >= 5000)
+	  {
+	      lastVrefTestTick = HAL_GetTick();
+	      ADC_TestVREFINT();
+	  }
+
 	  // Update heartbeat every second
 	  if (HAL_GetTick() - lastHeartbeatTick >= 1000)
 	  {
@@ -1753,27 +2125,6 @@ int main(void)
           debugPrinted = 1;
       }
 
-      // Handle STOP when the actuator is idle
-      if (stopRequested)
-      {
-          Motor_Stop();
-          stopRequested = 0;
-
-          const char msg[] = "STOP CONFIRMED\r\n";
-
-          HAL_UART_Transmit(&huart2,
-                            (uint8_t *)msg,
-                            sizeof(msg) - 1,
-                            100);
-      }
-
-      // Process a received command
-      if (commandReady)
-      {
-          ProcessCommand(commandBuffer);
-          commandReady = 0;
-      }
-
       // Read temperature every 2 seconds
       static uint32_t lastTemperatureRead = 0;
 
@@ -1789,9 +2140,10 @@ int main(void)
       if (HAL_GetTick() - lastVibrationRead >= 500)
       {
           lastVibrationRead = HAL_GetTick();
-          vibrationRMS_g = ADXL345_ReadVibrationRMS();
+          vibrationRMS_g = 0.0f;  // ADXL345 is disconnected for now
       }
 
+#if 0
       // ACS724 wiring test: read the ADC on A0 once per second.
       // Keep the 12V motor supply disconnected during this test.
       // Do not use this uncalibrated value for current protection yet.
@@ -1799,35 +2151,70 @@ int main(void)
       if (HAL_GetTick() - lastCurrentTestTick >= 1000)
       {
           lastCurrentTestTick = HAL_GetTick();
-          if (HAL_ADC_Start(&hadc1) == HAL_OK)
+
+          uint32_t adcSum = 0;
+          uint32_t adcRaw = 0;
+          int validSamples = 0;
+
+          // Take 10 ADC readings
+          for (int i = 0; i < 10; i++)
           {
-              if (HAL_ADC_PollForConversion(&hadc1, 100) == HAL_OK)
+              if (HAL_ADC_Start(&hadc1) == HAL_OK)
               {
-                  uint32_t adcRaw = HAL_ADC_GetValue(&hadc1);
-                  float adcVoltage = (float)adcRaw * 3.3f / 4095.0f;
-                  snprintf(txBuffer, sizeof(txBuffer),
-                           "ACS724 A0 ADC:%lu Voltage:%.3f V\r\n",
-                           (unsigned long)adcRaw, adcVoltage);
-                  HAL_UART_Transmit(&huart2, (uint8_t *)txBuffer,
-                                    strlen(txBuffer), 100);
+                  if (HAL_ADC_PollForConversion(&hadc1, 100) == HAL_OK)
+                  {
+                      adcSum += HAL_ADC_GetValue(&hadc1);
+                      validSamples++;
+                  }
+
+                  HAL_ADC_Stop(&hadc1);
               }
-              else
-              {
-                  const char msg[] = "ACS724 ADC timeout\r\n";
-                  HAL_UART_Transmit(&huart2, (uint8_t *)msg,
-                                    sizeof(msg) - 1, 100);
-              }
-              HAL_ADC_Stop(&hadc1);
+
+              HAL_Delay(2);
+          }
+
+          // Calculate average only if all 10 readings succeeded
+          if (validSamples == 10)
+          {
+              adcRaw = adcSum / 10;
+
+              printf("ADC RAW=%lu | ZERO=%.1f | DIFF=%.1f\r\n",
+                     (unsigned long)adcRaw,
+                     currentZeroADC,
+                     (float)adcRaw - currentZeroADC);
+
+              float adcDifference = (float)adcRaw - currentZeroADC;
+
+              // Voltage divider: 10k and 14.7k
+              float dividerRatio = 14.7f / 24.7f;
+
+              // Approximate current, assuming 66 mV/A sensitivity
+              motorCurrent = (adcDifference * 3.3f / 4095.0f)
+                             / (dividerRatio * 0.066f);
+
+              snprintf(txBuffer, sizeof(txBuffer),
+                       "ACS724 AVG ADC:%lu Zero:%.0f Current:%.3f A\r\n",
+                       (unsigned long)adcRaw,
+                       currentZeroADC,
+                       motorCurrent);
+
+              HAL_UART_Transmit(&huart2,
+                                (uint8_t *)txBuffer,
+                                strlen(txBuffer),
+                                100);
           }
           else
           {
-              const char msg[] = "ACS724 ADC start failed\r\n";
-              HAL_UART_Transmit(&huart2, (uint8_t *)msg,
-                                sizeof(msg) - 1, 100);
+              const char msg[] = "ACS724 ADC sampling failed\r\n";
+
+              HAL_UART_Transmit(&huart2,
+                                (uint8_t *)msg,
+                                sizeof(msg) - 1,
+                                100);
           }
       }
-      motorCurrent = 0.0f; // Placeholder until calibration and safe motor test.
 
+#endif
 
       actualPosition =
           (int16_t)__HAL_TIM_GET_COUNTER(&htim4);
@@ -2249,7 +2636,7 @@ static void MX_ADC1_Init(void)
   */
   sConfig.Channel = ADC_CHANNEL_0;
   sConfig.Rank = 1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_84CYCLES;
+  sConfig.SamplingTime = ADC_SAMPLETIME_480CYCLES;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
     Error_Handler();
@@ -2403,7 +2790,7 @@ static void MX_TIM3_Init(void)
     Error_Handler();
   }
   sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 0;
+  sConfigOC.Pulse = 25;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
   if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
@@ -2596,53 +2983,80 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+// Check if the motor test has reached 1 second
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance == TIM2)
+    {
+    	tim2InterruptCount++;
+        if (motorTestRunning &&
+            HAL_GetTick() - motorTestStart >= 1000)
+        {
+            Motor_Stop();
+            motorTestRunning = 0;
+            motorTestFinished = 1;
+        }
+    }
+}
+
+
 // Receive commands from the computer
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == USART2)
     {
-        // End of command
         if (rxByte == '\n' || rxByte == '\r')
         {
             if (rxIndex > 0)
             {
                 rxBuffer[rxIndex] = '\0';
-                // STOP must work while the actuator is moving
+
+                // Stop the motor as soon as STOP is received
                 if (strcmp(rxBuffer, "STOP") == 0)
                 {
+                    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 0);
                     stopRequested = 1;
+                    motorTestRunning = 0;
+                    commandHead = 0;
+                    commandTail = 0;
+                    commandCount = 0;
                 }
-                else if (!commandReady)
+                else if (commandCount < CMD_QUEUE_SIZE)
                 {
-                    // Save the complete command
-                    strcpy(commandBuffer, rxBuffer);
-                    // Tell the main program a command is ready
-                    commandReady = 1;
+                    // Save the new command
+                    strcpy(commandQueue[commandHead], rxBuffer);
+
+                    commandHead = (commandHead + 1) % CMD_QUEUE_SIZE;
+                    commandCount++;
                 }
-                // Start receiving a new command
+
                 rxIndex = 0;
             }
         }
         else
         {
-        	// Accept only valid command characters
-        	if ((rxByte >= 'A' && rxByte <= 'Z') ||
-        	    (rxByte >= '0' && rxByte <= '9') ||
-        	    rxByte == ',' ||
-        	    rxByte == '-')
-        	{
-        	    if (rxIndex < sizeof(rxBuffer) - 1)
-        	    {
-        	        rxBuffer[rxIndex] = rxByte;
-        	        rxIndex++;
-        	    }
-        	}
+            // Only accept command characters
+            if ((rxByte >= 'A' && rxByte <= 'Z') ||
+                (rxByte >= '0' && rxByte <= '9') ||
+                rxByte == ',' ||
+                rxByte == '-')
+            {
+                if (rxIndex < sizeof(rxBuffer) - 1)
+                {
+                    rxBuffer[rxIndex] = rxByte;
+                    rxIndex++;
+                }
+                else
+                {
+                    rxIndex = 0;
+                }
+            }
             else
             {
-                // Reset if the command is too long
                 rxIndex = 0;
             }
         }
+
         // Receive the next character
         HAL_UART_Receive_IT(&huart2, &rxByte, 1);
     }
@@ -2652,24 +3066,36 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 // Process commands from the computer
 void ProcessCommand(char *command)
 {
-	// Move command - TEST MODE (motor disabled)
+	HAL_UART_Transmit(&huart2,
+	                  (uint8_t *)"DEBUG: ProcessCommand called\r\n",
+	                  sizeof("DEBUG: ProcessCommand called\r\n") - 1,
+	                  100);
+
+	// Move command
 	if (strncmp(command, "MOVE,", 5) == 0)
 	{
+		const char msg[] = "DEBUG: MOVE command received\r\n";
+
+		HAL_UART_Transmit(&huart2,
+		                  (uint8_t *)msg,
+		                  sizeof(msg) - 1,
+		                  100);
+
 	    int32_t target = atoi(&command[5]);
 
-	    if (target >= -30000 && target <= 30000)
+	    if (target >= -20000 && target <= 20000)
 	    {
-	        // Keep the motor stopped during testing
-	        Motor_Stop();
-
-	        snprintf(txBuffer, sizeof(txBuffer),
-	                 "MOVE ACCEPTED | TEST MODE | Target:%ld\r\n",
-	                 (long)target);
-
-	        HAL_UART_Transmit(&huart2,
-	                          (uint8_t *)txBuffer,
-	                          strlen(txBuffer),
-	                          100);
+	    	if (systemStatus != STATUS_NORMAL || motorTestRunning)
+	        {
+	            Motor_Stop();
+	            printf("MOVE REJECTED | SYSTEM NOT READY\r\n");
+	        }
+	        else
+	        {
+//	        	printf("MOVE ACCEPTED | TEST MODE | Target:%ld\r\n", (long)target);
+	        	// Test the command without sending an extra reply
+	            Actuator_MoveTo((int16_t)target);
+	        }
 	    }
 	    else
 	    {
@@ -2683,10 +3109,35 @@ void ProcessCommand(char *command)
 	    }
 	}
 
-    // Stop the motor
+	// Start a short motor test
+	else if (strcmp(command, "TEST") == 0)
+	{
+		if (motorTestRunning == 0 &&
+		    stopRequested == 0 &&
+		    systemStatus == STATUS_NORMAL)
+	    {
+	        Motor_Backward();
+	        motorTestFinished = 0;
+	        motorTestStart = HAL_GetTick();
+	        motorTestRunning = 1;
+
+	        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 15);
+	    }
+	}
+
+	// Stop the motor
     else if (strcmp(command, "STOP") == 0)
     {
         Motor_Stop();
+        // Check if STOP turned off the PWM
+        snprintf(txBuffer, sizeof(txBuffer),
+                 "STOP PWM:%lu\r\n",
+                 (unsigned long)__HAL_TIM_GET_COMPARE(&htim3, TIM_CHANNEL_1));
+
+        HAL_UART_Transmit(&huart2,
+                          (uint8_t *)txBuffer,
+                          strlen(txBuffer),
+                          100);
         snprintf(txBuffer, sizeof(txBuffer),
                  "COMMAND RECEIVED | STOP\r\n");
         HAL_UART_Transmit(&huart2,
