@@ -19,7 +19,7 @@ Motor operation, encoder feedback, Ethernet communication, basic PLC logic, and 
 | CLICK PLUS C2-01CPU | PLC communication and Ladder Logic |
 | DS18B20 | Motor temperature readings |
 | ADXL345 | Vibration measurements over I²C |
-| ACS724 | Current sensing (still being tested) |
+| INA219 | Current monitoring through I²C and a 0.1 Ω shunt resistor |
 | Python, PySide6, PySerial | Desktop HMI on macOS |
 | STM32CubeIDE, Embedded C, STM32 HAL | Firmware development |
 
@@ -43,7 +43,7 @@ Motor operation, encoder feedback, Ethernet communication, basic PLC logic, and 
 STM32 sensors:
   I²C    -> ADXL345 vibration sensor
   1-Wire -> DS18B20 temperature sensor
-  ADC    -> ACS724 current sensor (not yet verified)
+  I²C    -> INA219 current sensor
 ```
 
 ## 1. STM32 Motor Control
@@ -60,9 +60,11 @@ Motor rotation and encoder feedback have been verified. The position-control rou
 
 ### Sensors and STM32 Peripherals
 
-The firmware also uses **UART** for HMI messages and debugging, **SPI** for the W5500, **I²C** for the ADXL345, **1-Wire** for the DS18B20, and **ADC** for current-sensor testing.
+The firmware also uses **UART** for HMI messages and debugging, **SPI** for the W5500, **I²C** for the ADXL345, **1-Wire** for the DS18B20, and **I²C** for INA219 current monitoring.
 
-The ADXL345 provides vibration data for RMS calculation. DS18B20 temperature readings have occasionally been unstable, and ACS724 current measurements are not yet verified. The HMI also displays NORMAL, WARNING, and ERROR status information.
+The ADXL345 provides vibration data for RMS calculation. DS18B20 temperature readings have occasionally been unstable, and INA219 current acquisition has been tested through I²C and UART telemetry. Current measurement accuracy has not been independently validated. The HMI also displays NORMAL, WARNING, and ERROR status information.
+
+**INA219 current monitoring:** The STM32 reads the INA219 shunt-voltage register over I²C and calculates current using the module’s 0.1 Ω (R100) shunt resistor. Initial serial tests returned approximately **0.016–0.019 A**, with the system telemetry reporting **0.02 A** after rounding. Successful register reads are marked `[VALID]`; this indicates a successful read, not independently verified measurement accuracy.
 
 ## 2. W5500 Ethernet Setup
 
@@ -189,7 +191,7 @@ Six alternating target commands between 0 and 200 counts produced final encoder 
 | MOVE timeout protection | Passed; PWM compare returned to 0 |
 | Position targets 0, 100, and 200 counts | Final errors within ±20 counts |
 | Six alternating 0 ↔ 200 count moves | Passed; maximum absolute error 14 counts |
-| ACS724 current measurement | Not yet verified |
+| INA219 current acquisition and UART telemetry | Passed in initial tests (0.016–0.019 A reported); accuracy not independently validated |
 | Independent physical emergency stop | Not yet tested |
 | PLC-commanded physical motor STOP | Not yet tested (Modbus communication only) |
 | Long-duration system reliability | Not yet tested |
@@ -202,7 +204,7 @@ These interfaces and RTOS features have not yet been implemented or verified.
 
 ## 8. Next Steps
 
-- Finish testing and calibrating the ACS724 current sensor.
+- Validate INA219 current measurement accuracy against an independent reference under known loads.
 - Improve the DS18B20 wiring and sensor-read timing.
 - Add a physical emergency-stop circuit and suitable electrical protection.
 - Validate the physical emergency-stop circuit independently of software STOP.
