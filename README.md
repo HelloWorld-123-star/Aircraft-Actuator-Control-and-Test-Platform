@@ -145,6 +145,7 @@ Basic tests confirmed PLC register reads, heartbeat updates, and receipt of an F
 ### HMI Dashboard
 
 ![HMI Dashboard](docs/images/hmi-dashboard.png)
+![HMI Dashboard](docs/images/hmi-dashboard_logging.png)
 
 A desktop HMI was developed using **Python, PySide6, and PySerial**, communicating with the STM32 over USB serial at **115200 baud**.
 
